@@ -11,7 +11,7 @@ use cortex_m_rt::entry;
 use defmt::panic;
 use embassy::time::{Alarm, Clock};
 use embassy_nrf::{interrupt, rtc};
-use nrf52840_hal::clocks;
+use nrf52810_hal::clocks;
 
 static mut RTC: MaybeUninit<rtc::RTC<embassy_nrf::pac::RTC1>> = MaybeUninit::uninit();
 

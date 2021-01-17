@@ -14,7 +14,7 @@ use embassy::time::{Clock, Duration, Timer};
 use embassy::util::Forever;
 use embassy_nrf::pac;
 use embassy_nrf::{interrupt, rtc};
-use nrf52840_hal::clocks;
+use nrf52810_hal::clocks;
 
 #[task]
 async fn run1() {
