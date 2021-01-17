@@ -115,7 +115,7 @@ pub fn interrupt_declare(item: TokenStream) -> TokenStream {
         unsafe impl OwnedInterrupt for #name_interrupt {
             type Priority = Priority;
             fn number(&self) -> u8 {
-                Interrupt::#name as u8
+                (Interrupt::#name as u8) + 1
             }
             unsafe fn __handler(&self) -> &'static ::embassy::interrupt::Handler {
                 #[export_name = #name_handler]
