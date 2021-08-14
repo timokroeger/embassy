@@ -12,7 +12,7 @@ use futures::TryFutureExt;
 
 use super::*;
 use crate::dma::NoDma;
-use crate::pac::usart::{regs, vals};
+use crate::pac::usart::{regs, vals, Usart};
 
 pub struct Uart<'d, T: Instance, TxDma = NoDma, RxDma = NoDma> {
     inner: T,
@@ -239,73 +239,66 @@ impl<'d, T: Instance> StateInner<'d, T>
 where
     Self: 'd,
 {
-    fn on_rx(&mut self) {
-        let r = self.uart.inner.regs();
-        unsafe {
-            let sr = r.sr().read();
-            let dr = r.dr().read();
+    unsafe fn on_rx(&mut self, regs: Usart, sr: regs::Sr) {
+        // Alawys read the data register to clear the error flags.
+        // Otherwise we can get stuck in the ISR when the RX buffer is full.
+        let dr = regs.dr().read();
 
-            if sr.rxne() {
-                if sr.pe() {
-                    info!("rx parity error");
-                }
-                if sr.fe() {
-                    info!("rx framing error");
-                }
-                if sr.ne() {
-                    info!("rx noise error");
-                }
-                if sr.ore() {
-                    warn!("rx overrun error");
-                }
+        if sr.pe() {
+            info!("rx parity error");
+        }
+        if sr.fe() {
+            info!("rx framing error");
+        }
+        if sr.ne() {
+            info!("rx noise error");
+        }
+        if sr.ore() {
+            warn!("rx overrun error");
+        }
 
-                trace!("rxne");
-                let buf = self.rx.push_buf();
-                if buf.is_empty() {
-                    warn!("rx buffer overrun");
-                } else {
-                    buf[0] = dr.0 as u8;
-                    self.rx.push(1);
-                }
+        if sr.rxne() {
+            trace!("rxne");
 
-                if self.rx.is_full() {
-                    trace!("rxbuf full");
-                    self.rx_waker.wake();
-
-                    // Disable interrupt until we have space to receive again
-                    r.cr1().modify(|w| {
-                        w.set_rxneie(false);
-                    });
-                    r.cr1.write()
-                }
+            let buf = self.rx.push_buf();
+            if buf.is_empty() {
+                warn!("rxbuf overrun");
+            } else {
+                buf[0] = dr.0 as u8;
+                self.rx.push(1);
             }
 
-            if sr.idle() {
-                trace!("idle");
-                r.dr().read(); // clear isr
-                self.rx_waker.wake();
-            };
+            let buf_len = self.rx.len();
+            if buf_len == self.rx.capacity() / 2 {
+                trace!("rxbuf half full");
+
+                self.rx_waker.wake()
+            } else if buf_len == self.rx.capacity() {
+                trace!("rxbuf full");
+            }
         }
+
+        if sr.idle() {
+            trace!("idle");
+            self.rx_waker.wake();
+        };
     }
 
-    fn on_tx(&mut self) {
-        let r = self.uart.inner.regs();
-        unsafe {
-            if r.sr().read().txe() && r.cr1().read().txeie() {
-                trace!("txe");
-                let buf = self.tx.pop_buf();
-                if !buf.is_empty() {
-                    trace!("sending next byte");
-                    r.dr().write_value(regs::Dr(buf[0].into()));
-                    self.tx.pop(1);
-                    self.tx_waker.wake();
-                } else {
-                    trace!("tx done");
-                    // Disable interrupt until we have something to transmit again
-                    r.cr1().modify(|w| {
-                        w.set_txeie(false);
-                    });
-                }
+    unsafe fn on_tx(&mut self, regs: Usart, sr: regs::Sr) {
+        let mut cr1 = regs.cr1().read();
+        if cr1.txeie() && sr.txe() {
+            trace!("txe");
+            let buf = self.tx.pop_buf();
+            if !buf.is_empty() {
+                trace!("sending next byte");
+                regs.dr().write_value(regs::Dr(buf[0].into()));
+                self.tx.pop(1);
+                self.tx_waker.wake();
+            } else {
+                trace!("tx done");
+                // Disable interrupt until we have something to transmit again
+                cr1.set_txeie(false);
+                regs.cr1().write_value(cr1);
             }
         }
     }
@@ -318,8 +311,14 @@ where
     type Interrupt = T::Interrupt;
     fn on_interrupt(&mut self) {
         trace!("usart irq");
-        self.on_rx();
-        self.on_tx();
+        unsafe {
+            let r = self.uart.inner.regs();
+
+            // Only read status once because the read operation clears some flags.
+            let sr = r.sr().read();
+            self.on_rx(r, sr);
+            self.on_tx(r, sr);
+        }
     }
 }
 
@@ -328,14 +327,13 @@ impl<'d, T: Instance> embassy::io::AsyncBufRead for BufferedUart<'d, T> {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<&[u8], embassy::io::Error>> {
-        trace!("poll_read");
+        trace!("poll_fill_buf");
         self.inner.with(|state| {
             compiler_fence(Ordering::SeqCst);
 
             // We have data ready in buffer? Return it.
-            let buf = state.rx.pop_buf();
-            if !buf.is_empty() {
-                let buf: &[u8] = buf;
+            if !state.rx.is_empty() {
+                let buf: &[u8] = state.rx.pop_buf();
                 // Safety: buffer lives as long as uart
                 let buf: &[u8] = unsafe { core::mem::transmute(buf) };
                 return Poll::Ready(Ok(buf));
@@ -349,18 +347,8 @@ impl<'d, T: Instance> embassy::io::AsyncBufRead for BufferedUart<'d, T> {
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
         self.inner.with(|state| {
             trace!("consume n={}", amt);
-            let was_full = state.rx.is_full();
             state.rx.pop(amt);
-            if was_full {
-                trace!("rxbuf not full anymore");
-                // safety: exclusive access guaranteed the peripheral mutex
-                unsafe {
-                    state.uart.inner.regs().cr1().modify(|w| w.set_rxneie(true));
-                }
-            }
         });
-        //trace!("pend");
-        //self.inner.pend();
     }
 }
 

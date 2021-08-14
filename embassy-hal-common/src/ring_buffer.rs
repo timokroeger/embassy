@@ -16,7 +16,7 @@ impl<'a> RingBuffer<'a> {
     }
 
     pub fn push_buf(&mut self) -> &mut [u8] {
-        if self.start == self.end && !self.empty {
+        if self.is_full() {
             trace!("  ringbuf: push_buf empty");
             return &mut self.buf[..0];
         }
@@ -87,6 +87,22 @@ impl<'a> RingBuffer<'a> {
     }
 
     pub fn is_full(&self) -> bool {
-        !self.empty && self.start == self.end
+        self.start == self.end && !self.empty
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn len(&self) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
+
+        if self.end > self.start {
+            self.end - self.start
+        } else {
+            self.capacity() - (self.start - self.end)
+        }
     }
 }
