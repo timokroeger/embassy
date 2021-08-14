@@ -1,6 +1,12 @@
+use atomic_polyfill::{compiler_fence, Ordering};
 use core::future::Future;
 use core::marker::PhantomData;
-use embassy::util::Unborrow;
+use core::pin::Pin;
+use core::task::Context;
+use core::task::Poll;
+use embassy::util::{Unborrow, WakerRegistration};
+use embassy_hal_common::peripheral::{PeripheralMutex, PeripheralState, StateStorage};
+use embassy_hal_common::ring_buffer::RingBuffer;
 use embassy_hal_common::unborrow;
 use futures::TryFutureExt;
 
@@ -169,5 +175,224 @@ impl<'d, T: Instance, TxDma, RxDma> embassy_traits::uart::Read for Uart<'d, T, T
 
     fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Self::ReadFuture<'a> {
         self.read_dma(buf).map_err(|_| embassy_traits::uart::Error::Other)
+    }
+}
+
+pub struct State<'d, T: Instance>(StateStorage<StateInner<'d, T>>);
+impl<'d, T: Instance> State<'d, T> {
+    pub fn new() -> Self {
+        Self(StateStorage::new())
+    }
+}
+
+pub struct StateInner<'d, T: Instance> {
+    uart: Uart<'d, T, NoDma, NoDma>,
+    phantom: PhantomData<&'d mut T>,
+
+    rx_waker: WakerRegistration,
+    rx: RingBuffer<'d>,
+
+    tx_waker: WakerRegistration,
+    tx: RingBuffer<'d>,
+}
+
+unsafe impl<'d, T: Instance> Send for StateInner<'d, T> {}
+unsafe impl<'d, T: Instance> Sync for StateInner<'d, T> {}
+
+pub struct BufferedUart<'d, T: Instance> {
+    inner: PeripheralMutex<'d, StateInner<'d, T>>,
+}
+
+impl<'d, T: Instance> Unpin for BufferedUart<'d, T> {}
+
+impl<'d, T: Instance> BufferedUart<'d, T> {
+    pub unsafe fn new(
+        state: &'d mut State<'d, T>,
+        uart: Uart<'d, T, NoDma, NoDma>,
+        irq: impl Unborrow<Target = T::Interrupt> + 'd,
+        tx_buffer: &'d mut [u8],
+        rx_buffer: &'d mut [u8],
+    ) -> BufferedUart<'d, T> {
+        unborrow!(irq);
+
+        let r = uart.inner.regs();
+        r.cr1().modify(|w| {
+            w.set_rxneie(true);
+            w.set_idleie(true);
+        });
+
+        Self {
+            inner: PeripheralMutex::new_unchecked(irq, &mut state.0, move || StateInner {
+                uart,
+                phantom: PhantomData,
+                tx: RingBuffer::new(tx_buffer),
+                tx_waker: WakerRegistration::new(),
+
+                rx: RingBuffer::new(rx_buffer),
+                rx_waker: WakerRegistration::new(),
+            }),
+        }
+    }
+}
+
+impl<'d, T: Instance> StateInner<'d, T>
+where
+    Self: 'd,
+{
+    fn on_rx(&mut self) {
+        let r = self.uart.inner.regs();
+        unsafe {
+            let sr = r.sr().read();
+            let dr = r.dr().read();
+
+            if sr.rxne() {
+                if sr.pe() {
+                    info!("rx parity error");
+                }
+                if sr.fe() {
+                    info!("rx framing error");
+                }
+                if sr.ne() {
+                    info!("rx noise error");
+                }
+                if sr.ore() {
+                    warn!("rx overrun error");
+                }
+
+                trace!("rxne");
+                let buf = self.rx.push_buf();
+                if buf.is_empty() {
+                    warn!("rx buffer overrun");
+                } else {
+                    buf[0] = dr.0 as u8;
+                    self.rx.push(1);
+                }
+
+                if self.rx.is_full() {
+                    trace!("rxbuf full");
+                    self.rx_waker.wake();
+
+                    // Disable interrupt until we have space to receive again
+                    r.cr1().modify(|w| {
+                        w.set_rxneie(false);
+                    });
+                    r.cr1.write()
+                }
+            }
+
+            if sr.idle() {
+                trace!("idle");
+                r.dr().read(); // clear isr
+                self.rx_waker.wake();
+            };
+        }
+    }
+
+    fn on_tx(&mut self) {
+        let r = self.uart.inner.regs();
+        unsafe {
+            if r.sr().read().txe() && r.cr1().read().txeie() {
+                trace!("txe");
+                let buf = self.tx.pop_buf();
+                if !buf.is_empty() {
+                    trace!("sending next byte");
+                    r.dr().write_value(regs::Dr(buf[0].into()));
+                    self.tx.pop(1);
+                    self.tx_waker.wake();
+                } else {
+                    trace!("tx done");
+                    // Disable interrupt until we have something to transmit again
+                    r.cr1().modify(|w| {
+                        w.set_txeie(false);
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl<'d, T: Instance> PeripheralState for StateInner<'d, T>
+where
+    Self: 'd,
+{
+    type Interrupt = T::Interrupt;
+    fn on_interrupt(&mut self) {
+        trace!("usart irq");
+        self.on_rx();
+        self.on_tx();
+    }
+}
+
+impl<'d, T: Instance> embassy::io::AsyncBufRead for BufferedUart<'d, T> {
+    fn poll_fill_buf(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<&[u8], embassy::io::Error>> {
+        trace!("poll_read");
+        self.inner.with(|state| {
+            compiler_fence(Ordering::SeqCst);
+
+            // We have data ready in buffer? Return it.
+            let buf = state.rx.pop_buf();
+            if !buf.is_empty() {
+                let buf: &[u8] = buf;
+                // Safety: buffer lives as long as uart
+                let buf: &[u8] = unsafe { core::mem::transmute(buf) };
+                return Poll::Ready(Ok(buf));
+            }
+
+            state.rx_waker.register(cx.waker());
+            Poll::<Result<&[u8], embassy::io::Error>>::Pending
+        })
+    }
+
+    fn consume(mut self: Pin<&mut Self>, amt: usize) {
+        self.inner.with(|state| {
+            trace!("consume n={}", amt);
+            let was_full = state.rx.is_full();
+            state.rx.pop(amt);
+            if was_full {
+                trace!("rxbuf not full anymore");
+                // safety: exclusive access guaranteed the peripheral mutex
+                unsafe {
+                    state.uart.inner.regs().cr1().modify(|w| w.set_rxneie(true));
+                }
+            }
+        });
+        //trace!("pend");
+        //self.inner.pend();
+    }
+}
+
+impl<'d, T: Instance> embassy::io::AsyncWrite for BufferedUart<'d, T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, embassy::io::Error>> {
+        let poll = self.inner.with(|state| {
+            if state.tx.is_empty() {
+                // safety: exclusive access guaranteed the peripheral mutex
+                unsafe {
+                    state.uart.inner.regs().cr1().modify(|w| w.set_txeie(true));
+                }
+            }
+
+            let tx_buf = state.tx.push_buf();
+            if tx_buf.is_empty() {
+                // No more space left in the buffer
+                trace!("poll_write tx buffer full");
+                state.tx_waker.register(cx.waker());
+                return Poll::Pending;
+            }
+
+            let n = core::cmp::min(tx_buf.len(), buf.len());
+            trace!("poll_write copy {} bytes", n);
+            tx_buf[..n].copy_from_slice(&buf[..n]);
+            state.tx.push(n);
+
+            Poll::Ready(Ok(n))
+        });
+        poll
     }
 }

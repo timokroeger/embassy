@@ -81,4 +81,12 @@ impl<'a> RingBuffer<'a> {
             n
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.empty
+    }
+
+    pub fn is_full(&self) -> bool {
+        !self.empty && self.start == self.end
+    }
 }
