@@ -33,10 +33,9 @@ async fn main(_spawner: embassy_executor::executor::Spawner, p: Peripherals) {
     let rfs = RadioSwitch::new(ctrl1, ctrl2, ctrl3);
 
     let radio = SubGhz::new(p.SUBGHZSPI, NoDma, NoDma);
-
     let irq = interrupt::take!(SUBGHZ_RADIO);
-    static mut RADIO_STATE: SubGhzState<'static> = SubGhzState::new();
-    let radio = unsafe { SubGhzRadio::new(&mut RADIO_STATE, radio, rfs, irq) };
+
+    let radio = SubGhzRadio::new(radio, rfs, irq);
 
     let mut region: region::Configuration = region::EU868::default().into();
 
