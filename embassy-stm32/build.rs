@@ -389,7 +389,7 @@ fn main() {
     let mut clock_gen = ClockGen {
         rcc_registers,
         chained_muxes: HashMap::new(),
-        force_refcount: HashSet::from(["usart"]),
+        force_refcount: HashSet::from(["usart", "ucpd"]),
 
         refcount_statics: BTreeSet::new(),
         clock_names: BTreeSet::new(),

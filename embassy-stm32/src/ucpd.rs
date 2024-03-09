@@ -133,8 +133,8 @@ impl<'d, T: Instance> Ucpd<'d, T> {
         // Enable hard reset receive interrupt.
         r.imr().modify(|w| w.set_rxhrstdetie(true));
 
-        // Both parts must be dropped before the peripheral can be disabled.
-        T::state().drop_not_ready.store(true, Ordering::Relaxed);
+        // !!!! cannot increment ref-count without reset !!!!
+        //T::enable_and_reset();
 
         into_ref!(rx_dma, tx_dma);
         let rx_dma_req = rx_dma.request();
@@ -159,21 +159,12 @@ pub struct CcPhy<'d, T: Instance> {
 
 impl<'d, T: Instance> Drop for CcPhy<'d, T> {
     fn drop(&mut self) {
-        let r = T::REGS;
-        r.cr().modify(|w| {
+        T::REGS.cr().modify(|w| {
             w.set_cc1tcdis(true);
             w.set_cc2tcdis(true);
             w.set_ccenable(Ccenable::DISABLED);
         });
-
-        // Check if the PdPhy part was dropped already.
-        let drop_not_ready = &T::state().drop_not_ready;
-        if drop_not_ready.load(Ordering::Relaxed) {
-            drop_not_ready.store(true, Ordering::Relaxed);
-        } else {
-            r.cfgr1().write(|w| w.set_ucpden(false));
-            T::disable();
-        }
+        T::disable();
     }
 }
 
@@ -279,17 +270,8 @@ pub struct PdPhy<'d, T: Instance> {
 
 impl<'d, T: Instance> Drop for PdPhy<'d, T> {
     fn drop(&mut self) {
-        let r = T::REGS;
-        r.cr().modify(|w| w.set_phyrxen(false));
-
-        // Check if the Type-C part was dropped already.
-        let drop_not_ready = &T::state().drop_not_ready;
-        if drop_not_ready.load(Ordering::Relaxed) {
-            drop_not_ready.store(true, Ordering::Relaxed);
-        } else {
-            r.cfgr1().write(|w| w.set_ucpden(false));
-            T::disable();
-        }
+        T::REGS.cr().modify(|w| w.set_phyrxen(false));
+        T::disable();
     }
 }
 
@@ -533,21 +515,16 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 pub trait Instance: sealed::Instance + RccPeripheral {}
 
 mod sealed {
-    use core::sync::atomic::AtomicBool;
-
     use embassy_sync::waitqueue::AtomicWaker;
 
     pub struct State {
         pub waker: AtomicWaker,
-        // Inverted logic for a default state of 0 so that the data goes into the .bss section.
-        pub drop_not_ready: AtomicBool,
     }
 
     impl State {
         pub const fn new() -> Self {
             Self {
                 waker: AtomicWaker::new(),
-                drop_not_ready: AtomicBool::new(false),
             }
         }
     }
